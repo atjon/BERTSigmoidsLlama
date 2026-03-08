@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3.11 --version)",
+      "Read(//usr/local/bin/**)",
+      "Bash(pyenv versions)"
+    ]
+  }
+}
