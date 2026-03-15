@@ -183,6 +183,7 @@ def find_highly_activating_tokens(
     if device is None:
         device = config.get_device()
 
+    tokenizer.truncation_side = "left"
     enc = tokenizer(
         text,
         max_length=config.MAX_SEQ_LEN,

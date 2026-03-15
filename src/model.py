@@ -35,7 +35,7 @@ def build_model(device: torch.device | None = None) -> BertForSequenceClassifica
 
     model = BertForSequenceClassification.from_pretrained(
         config.MODEL_ID,
-        num_labels=2,
+        num_labels=1,   # scalar reward score; pairwise ranking loss computed in train.py
     )
     model.to(device)
     logger.info("Loaded %s on %s", config.MODEL_ID, device)

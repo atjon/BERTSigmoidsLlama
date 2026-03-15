@@ -1,13 +1,17 @@
 """
 train.py — Fine-tuning loop, evaluation, and checkpointing.
 
-train()    — fine-tunes BertForSequenceClassification for TRAIN_EPOCHS epochs,
-             saving a checkpoint after each epoch and returning a training
-             history dict for plotting.
+train()              — fine-tunes the model with a pairwise ranking loss:
+                       loss = -log(sigmoid(score_chosen - score_rejected))
+                       Expects pair-format batches from load_pair_datasets().
 
-evaluate() — computes accuracy, F1, and a full sklearn classification report
-             on any labelled dataset.  Also computes the majority-class baseline
-             (always predict chosen = label 1) for direct comparison.
+evaluate_pairwise()  — computes pairwise accuracy on a pair-format dataset
+                       (fraction of pairs where score_chosen > score_rejected).
+                       Used for validation during training.
+
+evaluate()           — computes per-row accuracy and classification report on a
+                       flat (individual-row) dataset. Used for the interpretability
+                       pipeline's test-set evaluation.
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ import os
 from typing import Dict, List
 
 import torch
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import BertForSequenceClassification, BertTokenizer, get_linear_schedule_with_warmup
@@ -29,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Training
+# Training (pairwise ranking loss)
 # ---------------------------------------------------------------------------
 
 def train(
@@ -41,19 +46,20 @@ def train(
     start_epoch: int = 0,
 ) -> Dict[str, List[float]]:
     """
-    Fine-tune model on train_ds with validation after each epoch.
+    Fine-tune model on train_ds using pairwise ranking loss.
 
     Args:
-        model:     BertForSequenceClassification in train mode on device.
-        train_ds:  HuggingFace Dataset with torch format (input_ids, attention_mask, label).
-        val_ds:    Validation dataset in the same format.
-        tokenizer: Saved alongside each checkpoint so load_checkpoint works standalone.
-        device:    Target device. Defaults to config.get_device().
+        model:       BertForSequenceClassification (num_labels=1) in train mode on device.
+        train_ds:    Pair-format Dataset with fields:
+                     chosen_input_ids, chosen_attention_mask,
+                     rejected_input_ids, rejected_attention_mask.
+        val_ds:      Same pair format; evaluated with evaluate_pairwise() after each epoch.
+        tokenizer:   Saved alongside each checkpoint.
+        device:      Target device. Defaults to config.get_device().
         start_epoch: Epoch index to start/resume from.
 
     Returns:
-        History dict: {'epoch_numbers': [...], 'train_loss': [...], 'val_loss': [...], 'val_acc': [...]}
-        (one entry per epoch that was run in this call)
+        History dict: {'epoch_numbers', 'train_loss', 'val_loss', 'val_acc'}
     """
     if device is None:
         device = config.get_device()
@@ -62,15 +68,15 @@ def train(
         train_ds,
         batch_size=config.BATCH_SIZE,
         shuffle=True,
-        num_workers=0,   # 0 avoids issues with MPS + multiprocessing fork
+        num_workers=0,
     )
     val_loader = DataLoader(val_ds, batch_size=config.BATCH_SIZE * 2, num_workers=0)
 
     optimizer = AdamW(model.parameters(), lr=config.LR, weight_decay=0.01)
 
-    total_steps   = len(train_loader) * max(config.TRAIN_EPOCHS - start_epoch, 1)
-    warmup_steps  = int(total_steps * config.WARMUP_RATIO)
-    scheduler     = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+    total_steps  = len(train_loader) * max(config.TRAIN_EPOCHS - start_epoch, 1)
+    warmup_steps = int(total_steps * config.WARMUP_RATIO)
+    scheduler    = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
     history: Dict[str, List[float]] = {
         "epoch_numbers": [],
@@ -87,14 +93,21 @@ def train(
         # ---- train ----
         model.train()
         running_loss = 0.0
+
         for step, batch in enumerate(train_loader):
-            input_ids      = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels         = batch["label"].to(device)
+            chosen_ids    = batch["chosen_input_ids"].to(device)
+            chosen_mask   = batch["chosen_attention_mask"].to(device)
+            rejected_ids  = batch["rejected_input_ids"].to(device)
+            rejected_mask = batch["rejected_attention_mask"].to(device)
 
             optimizer.zero_grad()
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            loss    = outputs.loss
+
+            chosen_scores   = model(input_ids=chosen_ids,   attention_mask=chosen_mask).logits.squeeze(-1)
+            rejected_scores = model(input_ids=rejected_ids, attention_mask=rejected_mask).logits.squeeze(-1)
+
+            # Bradley-Terry ranking loss: -log(sigmoid(score_chosen - score_rejected))
+            loss = -F.logsigmoid(chosen_scores - rejected_scores).mean()
+
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.GRAD_CLIP)
             optimizer.step()
@@ -108,16 +121,16 @@ def train(
         avg_train_loss = running_loss / len(train_loader)
 
         # ---- validate ----
-        val_metrics = evaluate(model, val_ds, device, verbose=False)
+        val_metrics = evaluate_pairwise(model, val_ds, device, verbose=False)
         logger.info(
             "Epoch %d — train_loss=%.4f  val_loss=%.4f  val_acc=%.4f",
-            epoch, avg_train_loss, val_metrics["loss"], val_metrics["accuracy"],
+            epoch, avg_train_loss, val_metrics["loss"], val_metrics["pairwise_accuracy"],
         )
 
         history["epoch_numbers"].append(epoch + 1)
         history["train_loss"].append(avg_train_loss)
         history["val_loss"].append(val_metrics["loss"])
-        history["val_acc"].append(val_metrics["accuracy"])
+        history["val_acc"].append(val_metrics["pairwise_accuracy"])
 
         # ---- checkpoint ----
         ckpt_path = os.path.join(config.CHECKPOINT_DIR, f"epoch-{epoch}")
@@ -129,7 +142,60 @@ def train(
 
 
 # ---------------------------------------------------------------------------
-# Evaluation
+# Pairwise evaluation (used during training on val_pair_ds)
+# ---------------------------------------------------------------------------
+
+def evaluate_pairwise(
+    model: BertForSequenceClassification,
+    dataset: Dataset,
+    device: torch.device | None = None,
+    verbose: bool = True,
+) -> Dict:
+    """
+    Evaluate model on a pair-format dataset.
+
+    Returns a dict with:
+      - pairwise_accuracy: fraction of pairs where score_chosen > score_rejected
+      - loss: mean ranking loss
+    """
+    if device is None:
+        device = config.get_device()
+
+    loader = DataLoader(dataset, batch_size=config.BATCH_SIZE * 2, num_workers=0)
+    model.eval()
+
+    total_loss   = 0.0
+    total_correct = 0
+    total_pairs   = 0
+
+    with torch.no_grad():
+        for batch in loader:
+            chosen_ids    = batch["chosen_input_ids"].to(device)
+            chosen_mask   = batch["chosen_attention_mask"].to(device)
+            rejected_ids  = batch["rejected_input_ids"].to(device)
+            rejected_mask = batch["rejected_attention_mask"].to(device)
+
+            chosen_scores   = model(input_ids=chosen_ids,   attention_mask=chosen_mask).logits.squeeze(-1)
+            rejected_scores = model(input_ids=rejected_ids, attention_mask=rejected_mask).logits.squeeze(-1)
+
+            loss = -F.logsigmoid(chosen_scores - rejected_scores).mean()
+            total_loss += loss.item()
+
+            total_correct += (chosen_scores > rejected_scores).sum().item()
+            total_pairs   += chosen_scores.size(0)
+
+    avg_loss = total_loss / len(loader)
+    pair_acc = total_correct / total_pairs
+
+    if verbose:
+        print(f"\nPairwise accuracy : {pair_acc:.4f}")
+        print(f"Ranking loss      : {avg_loss:.4f}")
+
+    return {"pairwise_accuracy": pair_acc, "loss": avg_loss}
+
+
+# ---------------------------------------------------------------------------
+# Flat evaluation (used for test set in the interpretability pipeline)
 # ---------------------------------------------------------------------------
 
 def evaluate(
@@ -139,15 +205,13 @@ def evaluate(
     verbose: bool = True,
 ) -> Dict:
     """
-    Evaluate model on dataset.
+    Evaluate model on a flat (individual-row, binary-label) dataset.
+
+    The model outputs a scalar score (num_labels=1); we treat score > 0 as
+    predicting "chosen" (label=1) and score <= 0 as "rejected" (label=0).
 
     Returns a dict with:
-      - accuracy: float
-      - loss: float
-      - report: sklearn classification_report string
-      - majority_class_accuracy: float  (always-predict-chosen baseline)
-      - predictions: List[int]
-      - labels: List[int]
+      - accuracy, loss, report, majority_class_accuracy, predictions, labels
     """
     if device is None:
         device = config.get_device()
@@ -155,8 +219,8 @@ def evaluate(
     loader = DataLoader(dataset, batch_size=config.BATCH_SIZE * 2, num_workers=0)
     model.eval()
 
-    all_preds:  List[int]   = []
-    all_labels: List[int]   = []
+    all_preds:  List[int] = []
+    all_labels: List[int] = []
     total_loss = 0.0
 
     with torch.no_grad():
@@ -165,23 +229,24 @@ def evaluate(
             attention_mask = batch["attention_mask"].to(device)
             labels         = batch["label"].to(device)
 
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            total_loss += outputs.loss.item()
+            scores = model(input_ids=input_ids, attention_mask=attention_mask).logits.squeeze(-1)
 
-            preds = outputs.logits.argmax(dim=-1).cpu().tolist()
+            # Ranking loss against a zero reference (no explicit rejected pair here)
+            # Use BCE against label as a proxy loss for logging only.
+            loss = F.binary_cross_entropy_with_logits(scores, labels.float())
+            total_loss += loss.item()
+
+            preds = (scores > 0).long().cpu().tolist()
             all_preds.extend(preds)
             all_labels.extend(labels.cpu().tolist())
 
-    avg_loss = total_loss / len(loader)
-    acc      = accuracy_score(all_labels, all_preds)
-    report   = classification_report(
+    avg_loss     = total_loss / len(loader)
+    acc          = accuracy_score(all_labels, all_preds)
+    report       = classification_report(
         all_labels, all_preds,
         target_names=["rejected", "chosen"],
         digits=4,
     )
-
-    # Majority-class baseline: always predict chosen (label=1).
-    # Dataset is balanced 50/50 by construction, so this ≈ 50%.
     majority_acc = sum(1 for l in all_labels if l == 1) / len(all_labels)
 
     if verbose:
