@@ -2,6 +2,18 @@
 venv/
 env/
 ENV/
+.swift-module-cache/
+.build/
+DerivedData/
+.claude
+
 
 __pycache__/
 *.py[cod]
+
+# Large model artifacts — not committed
+checkpoints/
+outputs/activations/
+
+# HuggingFace dataset cache (auto-managed)
+.cache/
