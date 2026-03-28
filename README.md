@@ -1,5 +1,4 @@
 # BERTSigmoidsLlama
-CSE25 Project
 
 Mechanistic interpretability of a BERT preference classifier trained on Anthropic HH-RLHF data.
 `bert-base-uncased` is the subject model; Llama 3 8B (locally via Ollama) is the explainer.
